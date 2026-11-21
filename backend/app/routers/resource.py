@@ -21,6 +21,16 @@ def require_service(module: str):
     return service
 
 
+def collect_filters(service, request: Request) -> dict[str, str]:
+    """从查询参数收集筛选字段：通用列表字段 + 领域服务声明的扩展筛选字段。"""
+    allowed = set(service.LIST_FIELDS) | set(getattr(service, "REASON_FILTER_FIELDS", []))
+    return {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key in allowed and value.strip()
+    }
+
+
 @router.get("/{module}", response_model=PageResult[dict])
 def list_entries(
     module: str,
@@ -29,15 +39,22 @@ def list_entries(
     status: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=200),
+    cursor: str | None = Query(default=None),
 ) -> PageResult[dict]:
     service = require_service(module)
-    filters = {
-        key: value.strip()
-        for key, value in request.query_params.items()
-        if key in service.LIST_FIELDS and value.strip()
-    }
-    items, total = service.list_entries(
-        filters=filters, keyword=keyword, status=status, page=page, size=size)
+    filters = collect_filters(service, request)
+    try:
+        result = service.list_entries(
+            filters=filters, keyword=keyword, status=status,
+            page=page, size=size, cursor=cursor)
+    except ValueError as exc:
+        # 分页游标与筛选条件不一致等客户端可纠正问题
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 带游标分页的领域服务返回三元组：(items, total, next_cursor)
+    if isinstance(result, tuple) and len(result) == 3:
+        items, total, next_cursor = result
+        return PageResult(items=items, total=total, page=page, size=size, next_cursor=next_cursor)
+    items, total = result
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -49,13 +66,10 @@ def export_entries(
     status: str | None = Query(default=None),
 ) -> StreamingResponse:
     service = require_service(module)
-    filters = {
-        key: value.strip()
-        for key, value in request.query_params.items()
-        if key in service.LIST_FIELDS and value.strip()
-    }
-    items, _ = service.list_entries(
+    filters = collect_filters(service, request)
+    result = service.list_entries(
         filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
+    items = result[0]
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output, lineterminator="\n")

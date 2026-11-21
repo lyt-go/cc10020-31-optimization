@@ -174,7 +174,9 @@ class TestDlqReplay(unittest.TestCase):
     def test_failure_analysis(self):
         reasons = ["处理超时", "数据格式异常", "处理超时", "网络连接失败", "认证失败"]
         for i, reason in enumerate(reasons):
-            self.dlq_svc.enqueue_dead_letter(f"queue_{i % 2}", f'{{"id": {i}}}', reason, 1)
+            # 消息体需唯一，否则同指纹消息会按原始消息合并为一条死信记录
+            self.dlq_svc.enqueue_dead_letter(
+                f"queue_{i % 2}", f'{{"id": {i}, "seq": {reason}-{i}}}', reason, 1)
 
         analysis = self.dlq_svc.analyze_failure_reasons()
         self.assertEqual(analysis["total"], 5)

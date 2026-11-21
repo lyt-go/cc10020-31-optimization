@@ -87,15 +87,21 @@ class IntegrationMonitorService(BaseModuleService):
         except Exception as e:
             metrics["lake"] = {"error": str(e)}
 
-        # 死信队列指标 (dlq_handler)
+        # 死信队列指标 (dlq_handler)：跨模块直接复用死信原因筛选数据结果
         try:
             from app.services.dlq_handler import DlqHandlerService
             dlq_svc = DlqHandlerService()
             dlq_stats = dlq_svc.get_dlq_stats()
+            # 与死信模块同一份筛选规则下的原因分组与积压口径
+            reason_options = dlq_svc.get_reason_options()
+            backlog = dlq_svc.get_backlog_summary()
             metrics["dlq"] = {
                 "total_dlq": dlq_stats.get("total_dlq", 0),
                 "pending": dlq_stats.get("pending_dispatch", 0),
                 "replayed": dlq_stats.get("replayed_count", 0),
+                "backlog_total": backlog.get("积压消息总数", 0),
+                "reason_options": reason_options,
+                "backlog_by_queue": backlog.get("按原始队列", {}),
             }
         except Exception as e:
             metrics["dlq"] = {"error": str(e)}
@@ -228,6 +234,24 @@ class IntegrationMonitorService(BaseModuleService):
             "alerts_count": len(metrics.get("alerts", [])),
             "collected_at": metrics.get("collected_at"),
         }
+
+    def get_dlq_reason_dashboard(self, filters: dict[str, str] | None = None) -> dict[str, Any]:
+        """跨模块消费死信原因筛选数据：监控侧直接读取死信模块的分组与积压口径。"""
+        from app.services.dlq_handler import DlqHandlerService
+        dlq_svc = DlqHandlerService()
+        return {
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "filter_scope": filters or {},
+            "reason_options": dlq_svc.get_reason_options(filters),
+            "backlog": dlq_svc.get_backlog_summary(filters),
+        }
+
+    def export_dlq_review_ledger(self, team: str, filters: dict[str, str] | None = None,
+                                 remark: str = "") -> dict[str, Any]:
+        """把监控侧使用的死信原因分组结果写入值班复核台账。"""
+        from app.services.dlq_handler import DlqHandlerService
+        dlq_svc = DlqHandlerService()
+        return dlq_svc.create_review(team=team, filters=filters, remark=remark or "集成监控跨模块发起")
 
     def get_alerts(self, limit: int = 20) -> list[dict[str, Any]]:
         """获取告警历史。"""

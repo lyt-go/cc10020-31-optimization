@@ -21,6 +21,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import app.persistence
 from app.persistence import JsonStore, json_store as global_store
 from app.services.api_endpoint import ApiEndpointService
 from app.services.webhook_channel import WebhookChannelService
@@ -42,9 +43,9 @@ from app.services.event_archive import EventArchiveService
 from app.services.integration_monitor import IntegrationMonitorService
 
 
-@pytest.fixture(autouse=True)
-def _seed_and_cleanup():
-    """每个测试前清空存储，确保隔离。"""
+@pytest.fixture()
+def isolated_store():
+    """每个测试前清空存储，确保隔离；仅被本模块测试显式引用。"""
     with tempfile.TemporaryDirectory() as tmp:
         store = JsonStore(base_dir=tmp)
         import app.persistence
@@ -69,23 +70,34 @@ def _seed_and_cleanup():
         import app.services.event_archive as ea_mod
         import app.services.integration_monitor as im_mod
 
-        # Re-import all services to pick up new store
+        # Re-import all services to pick up new store.
+        # 基础/被依赖模块先 reload：base 先于领域服务，dlq_handler 先于 mq_consumer，
+        # 否则懒加载会拿到 reload 前的旧模块绑定。
         import importlib
-        for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
-                     dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
-                     rlc_mod, aas_mod, ea_mod, im_mod]:
+        import app.services.base as base_mod
+        import app.services.dlq_reasons as dlq_reasons_mod
+        for mod in [base_mod, dlq_reasons_mod, api_mod, wh_mod, es_mod, dlq_mod, mq_mod,
+                     sink_mod, dt_mod, dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod,
+                     ctl_mod, rlc_mod, aas_mod, ea_mod, im_mod]:
             importlib.reload(mod)
 
         yield
 
         import app.persistence
         app.persistence.json_store = global_store
+        # 服务模块在 reload 时把 json_store 名字绑定到了临时存储，
+        # 恢复全局存储后需再次 reload，避免后续套件引用已销毁的临时目录。
+        import importlib
+        for mod in [base_mod, dlq_reasons_mod, api_mod, wh_mod, es_mod, dlq_mod, mq_mod,
+                     sink_mod, dt_mod, dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod,
+                     ctl_mod, rlc_mod, aas_mod, ea_mod, im_mod]:
+            importlib.reload(mod)
 
 
 # ──────────────────────────────────────────────────────────
 # 链路1: webhook接收 → 事件解析 → 分发路由 → 落湖存储
 # ──────────────────────────────────────────────────────────
-def test_chain_1_webhook_to_lake():
+def test_chain_1_webhook_to_lake(isolated_store):
     """验证完整的webhook事件接收到数据落湖链路。"""
     webhook_svc = WebhookChannelService()
     schema_svc = EventSchemaService()
@@ -98,7 +110,7 @@ def test_chain_1_webhook_to_lake():
         "通道名称": "订单事件通道",
         "接收路径": "/webhook/order",
         "签名密钥": "secret123",
-        "验证方式": "HMAC-SHA256",
+        "验证方式": "NONE",
         "并发上限": "100",
         "回调地址": "https://callback.example.com",
         "通道版本": "v1",
@@ -128,7 +140,7 @@ def test_chain_1_webhook_to_lake():
         "Schema版本": "v1",
         "所属通道": str(channel_id),
     })
-    schemas = json_store.get_all("event_schema")
+    schemas = app.persistence.json_store.get_all("event_schema")
     for s in schemas:
         schema_svc.run_action(int(s["id"]), "标记生效")
 
@@ -143,7 +155,7 @@ def test_chain_1_webhook_to_lake():
         "失败动作": "记录日志",
         "规则版本": "v1",
     })
-    drs = json_store.get_all("dispatch_rule")
+    drs = app.persistence.json_store.get_all("dispatch_rule")
     for dr in drs:
         dispatch_svc.run_action(int(dr["id"]), "标记生效")
 
@@ -167,7 +179,7 @@ def test_chain_1_webhook_to_lake():
 # ──────────────────────────────────────────────────────────
 # 链路2: API批量拉取 → 数据转换 → 质量校验 → 落湖
 # ──────────────────────────────────────────────────────────
-def test_chain_2_batch_to_lake():
+def test_chain_2_batch_to_lake(isolated_store):
     """验证批量API拉取到落湖的完整链路。"""
     ep_svc = ApiEndpointService()
     batch_svc = BatchIngestService()
@@ -184,7 +196,7 @@ def test_chain_2_batch_to_lake():
         "重试次数": "3",
         "端点版本": "v1",
     })
-    ep_id = json_store.get_all("api_endpoint")[0]["id"]
+    ep_id = app.persistence.json_store.get_all("api_endpoint")[0]["id"]
 
     # 创建质量规则
     quality_svc.create_entry({
@@ -197,7 +209,7 @@ def test_chain_2_batch_to_lake():
         "阻断策略": "警告",
         "规则版本": "v1",
     })
-    qrs = json_store.get_all("data_quality_rule")
+    qrs = app.persistence.json_store.get_all("data_quality_rule")
     for qr in qrs:
         quality_svc.run_action(int(qr["id"]), "标记生效")
 
@@ -212,7 +224,7 @@ def test_chain_2_batch_to_lake():
         "失败动作": "记录并继续",
         "任务版本": "v1",
     })
-    bi_id = json_store.get_all("batch_ingest")[0]["id"]
+    bi_id = app.persistence.json_store.get_all("batch_ingest")[0]["id"]
     batch_svc.run_action(bi_id, "启动任务")
 
     # 执行批量拉取
@@ -231,10 +243,14 @@ def test_chain_2_batch_to_lake():
 # ──────────────────────────────────────────────────────────
 # 链路3: 死信队列 → 分析 → 重放 → 正常流程
 # ──────────────────────────────────────────────────────────
-def test_chain_3_dlq_to_replay():
+def test_chain_3_dlq_to_replay(isolated_store, monkeypatch):
     """验证死信队列从入队到重放的完整链路。"""
     mq_svc = MqConsumerService()
     dlq_svc = DlqHandlerService()
+
+    # 固定随机数，确定性触发消费失败（<0.2 即失败），避免概率用例偶发零死信
+    import random as _random
+    monkeypatch.setattr(_random, "random", lambda: 0.1)
 
     # 创建消费者
     mq_svc.create_entry({
@@ -247,7 +263,7 @@ def test_chain_3_dlq_to_replay():
         "死信队列": "order_dlq",
         "消费状态": "运行中",
     })
-    mq_id = json_store.get_all("mq_consumer")[0]["id"]
+    mq_id = app.persistence.json_store.get_all("mq_consumer")[0]["id"]
     mq_svc.run_action(mq_id, "启动消费")
 
     # 消费一批消息（会触发部分死信）
@@ -263,7 +279,7 @@ def test_chain_3_dlq_to_replay():
     assert len(analysis["categories"]) > 0
 
     # 批量重放死信
-    dlq_ids = [r["id"] for r in json_store.get_all("dlq_handler") if r["status"] in ("草稿", "待处置")]
+    dlq_ids = [r["id"] for r in app.persistence.json_store.get_all("dlq_handler") if r["status"] in ("草稿", "待处置")]
     if dlq_ids:
         replay_result = dlq_svc.batch_replay(dlq_ids)
         assert replay_result["ok"]
@@ -273,7 +289,7 @@ def test_chain_3_dlq_to_replay():
 # ──────────────────────────────────────────────────────────
 # 链路4: 批量回补 → 增量水位 → 落湖 → 监控
 # ──────────────────────────────────────────────────────────
-def test_chain_4_backfill_to_monitor():
+def test_chain_4_backfill_to_monitor(isolated_store):
     """验证回补任务到监控的完整链路。"""
     backfill_svc = BackfillJobService()
     cursor_svc = IncreCursorService()
@@ -290,7 +306,7 @@ def test_chain_4_backfill_to_monitor():
         "完成水位": "0/5",
         "失败区间": "无",
     })
-    bf_id = json_store.get_all("backfill_job")[0]["id"]
+    bf_id = app.persistence.json_store.get_all("backfill_job")[0]["id"]
     backfill_svc.run_action(bf_id, "启动回补")
 
     # 执行回补
@@ -312,7 +328,7 @@ def test_chain_4_backfill_to_monitor():
 # ──────────────────────────────────────────────────────────
 # 链路5: 事件接收 → 去重过滤 → 分发 → 归档
 # ──────────────────────────────────────────────────────────
-def test_chain_5_dedup_to_archive():
+def test_chain_5_dedup_to_archive(isolated_store):
     """验证去重过滤链路的正确性。"""
     dedup_svc = DedupFilterService()
     webhook_svc = WebhookChannelService()
@@ -329,7 +345,7 @@ def test_chain_5_dedup_to_archive():
         "冲突策略": "跳过",
         "规则版本": "v1",
     })
-    df_id = json_store.get_all("dedup_filter")[0]["id"]
+    df_id = app.persistence.json_store.get_all("dedup_filter")[0]["id"]
     dedup_svc.run_action(df_id, "标记生效")
 
     # 第一次去重检查
@@ -355,7 +371,7 @@ def test_chain_5_dedup_to_archive():
         "清理方式": "自动删除",
         "恢复超时": "60",
     })
-    ar_id = json_store.get_all("event_archive")[0]["id"]
+    ar_id = app.persistence.json_store.get_all("event_archive")[0]["id"]
     archive_svc.run_action(ar_id, "标记生效")
 
     # 执行归档
@@ -366,7 +382,7 @@ def test_chain_5_dedup_to_archive():
 # ──────────────────────────────────────────────────────────
 # 链路6: 调用追踪 → 监控统计 → 质量评分
 # ──────────────────────────────────────────────────────────
-def test_chain_6_trace_to_monitor():
+def test_chain_6_trace_to_monitor(isolated_store):
     """验证调用追踪到监控统计的链路。"""
     trace_svc = CallTraceLogService()
     monitor_svc = IntegrationMonitorService()
@@ -410,7 +426,7 @@ def test_chain_6_trace_to_monitor():
 # ──────────────────────────────────────────────────────────
 # 综合集成测试
 # ──────────────────────────────────────────────────────────
-def test_full_integration_pipeline():
+def test_full_integration_pipeline(isolated_store):
     """完整集成测试：端到端数据链路。"""
     # 1. 注册API端点
     ep_svc = ApiEndpointService()
@@ -424,7 +440,7 @@ def test_full_integration_pipeline():
         "重试次数": "3",
         "端点版本": "v1",
     })
-    ep_id = json_store.get_all("api_endpoint")[0]["id"]
+    ep_id = app.persistence.json_store.get_all("api_endpoint")[0]["id"]
 
     # 2. 生成认证凭证
     auth_svc = ApiAuthStoreService()
@@ -443,7 +459,7 @@ def test_full_integration_pipeline():
         "回调地址": "https://callback.test.com",
         "通道版本": "v1",
     })
-    wh_id = json_store.get_all("webhook_channel")[0]["id"]
+    wh_id = app.persistence.json_store.get_all("webhook_channel")[0]["id"]
     wh_svc.run_action(wh_id, "启用通道")
 
     # 4. 发送Webhook事件

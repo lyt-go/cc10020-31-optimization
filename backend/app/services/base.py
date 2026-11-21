@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.persistence import json_store
 from app.store import store
 
 
@@ -23,7 +24,9 @@ class BaseModuleService:
         status: str | None = None,
         page: int = 1,
         size: int = 20,
+        cursor: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
+        # cursor 仅在死信等带游标分页的领域服务里使用，通用模块忽略该参数
         rows = list(store.rows(self.MODULE))
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
@@ -41,7 +44,11 @@ class BaseModuleService:
         return rows[start:start + size], total
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
-        return store.find(self.MODULE, entry_id)
+        # 领域数据可能落在内存 store 或 json_store，两处都查，优先内存视图
+        entry = store.find(self.MODULE, entry_id)
+        if entry is not None:
+            return entry
+        return json_store.get_by_id(self.MODULE, entry_id)
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         missing = [
@@ -57,6 +64,10 @@ class BaseModuleService:
         entry["pending"] = True
         entry["abnormal"] = False
         rows.append(entry)
+        # 同步到 json_store，保证领域逻辑与测试从持久化存储也能读到新登记记录。
+        # json_store.insert 会自行分配 ID，回写以保持两套存储的记录身份一致。
+        persisted = json_store.insert(self.MODULE, dict(entry))
+        entry["id"] = persisted["id"]
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
@@ -67,8 +78,17 @@ class BaseModuleService:
         if target is None:
             return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
         entry["status"] = target
+        # pending 与状态机保持一致：进入末态即不再待处置，避免筛选口径与状态脱节
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        # 同一记录若也存在于 json_store（领域服务的持久化数据），同步状态流转，
+        # 避免动作只改内存视图、领域逻辑仍读到旧状态的双存储不一致。
+        if json_store.get_by_id(self.MODULE, entry_id) is not None:
+            json_store.update(self.MODULE, entry_id, {
+                "status": target,
+                "pending": entry["pending"],
+                "abnormal": entry["abnormal"],
+            })
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:

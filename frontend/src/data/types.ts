@@ -25,6 +25,7 @@ export type PageResult = {
   total: number
   page: number
   size: number
+  next_cursor?: string | null
 }
 
 export type ActionResult = {

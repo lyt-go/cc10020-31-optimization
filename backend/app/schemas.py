@@ -13,6 +13,8 @@ class PageResult(BaseModel, Generic[T]):
     total: int
     page: int = 1
     size: int = 20
+    # 游标分页模块（如死信检索）回传下一页边界，绑定原死信身份与筛选条件
+    next_cursor: str | None = None
 
 
 class ActionResult(BaseModel):

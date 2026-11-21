@@ -28,6 +28,8 @@ class BatchExecuteRequest(BaseModel):
 
 class DlqReplayRequest(BaseModel):
     dlq_ids: list[int]
+    replay_reason: str | None = None
+    force_fail: bool = False
 
 
 class BackfillExecuteRequest(BaseModel):
@@ -94,9 +96,11 @@ def pipeline_dlq_replay(request: DlqReplayRequest) -> dict[str, Any]:
         from app.persistence import json_store
         all_dlq = json_store.get_all("dlq_handler")
         pending_ids = [int(r["id"]) for r in all_dlq if r.get("status") in ("草稿", "待处置")]
-        return svc.batch_replay(pending_ids)
+        return svc.batch_replay(
+            pending_ids, replay_reason=request.replay_reason, force_fail=request.force_fail)
 
-    return svc.batch_replay(request.dlq_ids)
+    return svc.batch_replay(
+        request.dlq_ids, replay_reason=request.replay_reason, force_fail=request.force_fail)
 
 
 @router.post("/backfill-execute")
